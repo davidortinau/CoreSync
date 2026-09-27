@@ -1,15 +1,18 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <Version Condition=" '$(APPVEYOR_BUILD_VERSION)' == '' ">0.0.1-local</Version>
+    <Version Condition=" '$(APPVEYOR_BUILD_VERSION)' == '' ">0.0.2-local.provisioning.20260927.2</Version>
     <Version Condition=" '$(APPVEYOR_BUILD_VERSION)' != '' ">$(APPVEYOR_BUILD_VERSION)</Version>
+    <AssemblyVersion Condition=" '$(Version)' == '0.0.2-local.provisioning.20260927.2' ">0.0.1.0</AssemblyVersion>
     <TargetFramework>netstandard2.0</TargetFramework>
     <Authors>adospace</Authors>
     <Description>CoreSync is a .NET standard library that provides data synchronization functions between databases. This is the PostgreSQL provider assembly.</Description>
     <Copyright>Adolfo Marinucci</Copyright>
     <PackageProjectUrl>https://github.com/adospace/CoreSync</PackageProjectUrl>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
     <RepositoryUrl>https://github.com/adospace/CoreSync</RepositoryUrl>
+    <PackageReleaseNotes Condition=" '$(Version)' == '0.0.2-local.provisioning.20260927.2' ">Uncommitted local build on fix/postgres-caller-owned-provisioning, based on f32944d. Adds caller-owned PostgreSQL provisioning. Not an upstream release.</PackageReleaseNotes>
     <PackageTags>postgresql postgres data database sync synchronization .net</PackageTags>
     <GeneratePackageOnBuild>true</GeneratePackageOnBuild>
     <PackageRequireLicenseAcceptance>true</PackageRequireLicenseAcceptance>
@@ -26,6 +29,7 @@
 
   <ItemGroup>
     <Compile Include="..\CoreSync\Validate.cs" Link="Validate.cs" />
+    <None Include="..\..\README.md" Pack="true" PackagePath="/" />
   </ItemGroup>
 
   <ItemGroup>

@@ -3,6 +3,7 @@ using Npgsql;
 using System;
 using System.Collections.Generic;
 using System.ComponentModel.DataAnnotations.Schema;
+using System.Data;
 using System.Linq;
 using System.Reflection;
 using System.Threading;
@@ -502,47 +503,51 @@ namespace CoreSync.PostgreSQL
             if (_initialized)
                 return;
 
-            using (var connection = new NpgsqlConnection(Configuration.ConnectionString))
-            {
-                await connection.OpenAsync(cancellationToken);
+            using var connection = new NpgsqlConnection(Configuration.ConnectionString);
+            await connection.OpenAsync(cancellationToken);
+            using var session = new ProvisioningSession(connection, null, cancellationToken);
+            await InitializeStoreAsync(session, cancellationToken, cacheInitialization: true);
+        }
 
-                using var cmd = connection.CreateCommand();
-                cmd.CommandText = $@"CREATE TABLE IF NOT EXISTS __core_sync_ct 
+        private async Task InitializeStoreAsync(ProvisioningSession session, CancellationToken cancellationToken, bool cacheInitialization)
+        {
+            using var cmd = session.CreateCommand(cancellationToken);
+            cmd.CommandText = $@"CREATE TABLE IF NOT EXISTS __core_sync_ct
 (id BIGSERIAL PRIMARY KEY, tbl TEXT NOT NULL, op CHAR(1) NOT NULL, pk_integer BIGINT NULL, pk_text TEXT NULL, pk_bytea BYTEA NULL, src TEXT NULL)";
-                await cmd.ExecuteNonQueryAsync(cancellationToken);
+            await session.ExecuteNonQueryAsync(cmd, cancellationToken);
 
-                cmd.CommandText = $"CREATE INDEX IF NOT EXISTS __core_sync_ct_pk_integer_index ON __core_sync_ct(pk_integer)";
-                await cmd.ExecuteNonQueryAsync(cancellationToken);
-                cmd.CommandText = $"CREATE INDEX IF NOT EXISTS __core_sync_ct_pk_text_index ON __core_sync_ct(pk_text)";
-                await cmd.ExecuteNonQueryAsync(cancellationToken);
-                cmd.CommandText = $"CREATE INDEX IF NOT EXISTS __core_sync_ct_pk_bytea_index ON __core_sync_ct(pk_bytea)";
-                await cmd.ExecuteNonQueryAsync(cancellationToken);
+            cmd.CommandText = $"CREATE INDEX IF NOT EXISTS __core_sync_ct_pk_integer_index ON __core_sync_ct(pk_integer)";
+            await session.ExecuteNonQueryAsync(cmd, cancellationToken);
+            cmd.CommandText = $"CREATE INDEX IF NOT EXISTS __core_sync_ct_pk_text_index ON __core_sync_ct(pk_text)";
+            await session.ExecuteNonQueryAsync(cmd, cancellationToken);
+            cmd.CommandText = $"CREATE INDEX IF NOT EXISTS __core_sync_ct_pk_bytea_index ON __core_sync_ct(pk_bytea)";
+            await session.ExecuteNonQueryAsync(cmd, cancellationToken);
 
-                cmd.CommandText = $"CREATE TABLE IF NOT EXISTS __core_sync_remote_anchor (id TEXT NOT NULL PRIMARY KEY, local_version BIGINT NULL, remote_version BIGINT NULL)";
-                await cmd.ExecuteNonQueryAsync(cancellationToken);
+            cmd.CommandText = $"CREATE TABLE IF NOT EXISTS __core_sync_remote_anchor (id TEXT NOT NULL PRIMARY KEY, local_version BIGINT NULL, remote_version BIGINT NULL)";
+            await session.ExecuteNonQueryAsync(cmd, cancellationToken);
 
-                cmd.CommandText = $"CREATE TABLE IF NOT EXISTS __core_sync_local_id (id TEXT NOT NULL PRIMARY KEY)";
-                await cmd.ExecuteNonQueryAsync(cancellationToken);
+            cmd.CommandText = $"CREATE TABLE IF NOT EXISTS __core_sync_local_id (id TEXT NOT NULL PRIMARY KEY)";
+            await session.ExecuteNonQueryAsync(cmd, cancellationToken);
 
-                cmd.CommandText = $"SELECT id FROM __core_sync_local_id LIMIT 1";
-                var localId = await cmd.ExecuteScalarAsync(cancellationToken);
-                if (localId == null)
+            cmd.CommandText = $"SELECT id FROM __core_sync_local_id LIMIT 1";
+            session.EnsureActive(cancellationToken);
+            var localId = await cmd.ExecuteScalarAsync(cancellationToken);
+            session.EnsureActive(cancellationToken);
+            if (localId == null)
+            {
+                localId = Guid.NewGuid().ToString();
+                cmd.CommandText = $"INSERT INTO __core_sync_local_id (id) VALUES ($1)";
+                cmd.Parameters.Add(new NpgsqlParameter { Value = localId });
+                if (1 != await session.ExecuteNonQueryAsync(cmd, cancellationToken))
                 {
-                    localId = Guid.NewGuid().ToString();
-                    cmd.CommandText = $"INSERT INTO __core_sync_local_id (id) VALUES ($1)";
-                    cmd.Parameters.Add(new NpgsqlParameter { Value = localId });
-                    if (1 != await cmd.ExecuteNonQueryAsync(cancellationToken))
-                    {
-                        throw new InvalidOperationException();
-                    }
-                    cmd.Parameters.Clear();
+                    throw new InvalidOperationException();
                 }
+                cmd.Parameters.Clear();
+            }
 
-                _storeId = Guid.Parse((string)localId);
-
-                foreach (PostgreSQLSyncTable table in Configuration.Tables)
-                {
-                    cmd.CommandText = $@"SELECT c.column_name, c.data_type, 
+            foreach (PostgreSQLSyncTable table in Configuration.Tables)
+            {
+                cmd.CommandText = $@"SELECT c.column_name, c.data_type,
                         CASE WHEN pk.column_name IS NOT NULL THEN true ELSE false END as is_primary_key
                         FROM information_schema.columns c
                         LEFT JOIN (
@@ -554,43 +559,49 @@ namespace CoreSync.PostgreSQL
                         ) pk ON c.column_name = pk.column_name
                         WHERE c.table_name = $1
                         ORDER BY c.ordinal_position";
-                    cmd.Parameters.Clear();
-                    cmd.Parameters.Add(new NpgsqlParameter { Value = table.Name });
-                    using (var reader = await cmd.ExecuteReaderAsync(cancellationToken))
+                cmd.Parameters.Clear();
+                cmd.Parameters.Add(new NpgsqlParameter { Value = table.Name });
+                var columns = new Dictionary<string, PostgreSQLColumn>();
+                session.EnsureActive(cancellationToken);
+                using (var reader = await cmd.ExecuteReaderAsync(cancellationToken))
+                {
+                    while (await reader.ReadAsync(cancellationToken))
                     {
-                        while (await reader.ReadAsync(cancellationToken))
+                        var colName = reader.GetString(0);
+                        var colType = reader.GetString(1);
+                        var pk = reader.GetBoolean(2);
+
+                        if (string.CompareOrdinal(colName, "__op") == 0)
                         {
-                            var colName = reader.GetString(0);
-                            var colType = reader.GetString(1);
-                            var pk = reader.GetBoolean(2);
-
-                            if (string.CompareOrdinal(colName, "__op") == 0)
-                            {
-                                throw new NotSupportedException($"Unable to synchronize table '{table.Name}': one column has a reserved name '__op'");
-                            }
-
-                            table.Columns.Add(colName, new PostgreSQLColumn(colName, colType, pk));
+                            throw new NotSupportedException($"Unable to synchronize table '{table.Name}': one column has a reserved name '__op'");
                         }
-                    }
 
-                    if (table.Columns.Count == 0)
-                    {
-                        throw new InvalidOperationException($"Unable to configure table '{table}': does it exist with at least one column?");
-                    }
-
-                    if (table.Columns.Count(_ => _.Value.IsPrimaryKey) == 0)
-                    {
-                        throw new NotSupportedException($"Unable to configure table '{table}': no primary key defined");
-                    }
-
-                    if (table.Columns.Count(_ => _.Value.IsPrimaryKey) > 1)
-                    {
-                        throw new NotSupportedException($"Unable to configure table '{table}': it has more than one column as primary key");
+                        columns.Add(colName, new PostgreSQLColumn(colName, colType, pk));
                     }
                 }
+                session.EnsureActive(cancellationToken);
+
+                if (columns.Count == 0)
+                {
+                    throw new InvalidOperationException($"Unable to configure table '{table}': does it exist with at least one column?");
+                }
+
+                if (columns.Count(_ => _.Value.IsPrimaryKey) == 0)
+                {
+                    throw new NotSupportedException($"Unable to configure table '{table}': no primary key defined");
+                }
+
+                if (columns.Count(_ => _.Value.IsPrimaryKey) > 1)
+                {
+                    throw new NotSupportedException($"Unable to configure table '{table}': it has more than one column as primary key");
+                }
+
+                table.Columns = columns;
             }
 
-            _initialized = true;
+            session.EnsureActive(cancellationToken);
+            _storeId = Guid.Parse((string)localId);
+            _initialized = cacheInitialization;
         }
 
         public async Task ApplyProvisionAsync(CancellationToken cancellationToken = default)
@@ -600,23 +611,84 @@ namespace CoreSync.PostgreSQL
             using var connection = new NpgsqlConnection(Configuration.ConnectionString);
             await connection.OpenAsync(cancellationToken);
 
-            using var cmd = connection.CreateCommand();
+            using var session = new ProvisioningSession(connection, null, cancellationToken);
+            await CreateTriggersAsync(session, cancellationToken);
+        }
+
+        /// <summary>
+        /// Provisions change tracking on an already-open PostgreSQL connection, without opening
+        /// another connection or taking ownership of the supplied connection.
+        /// </summary>
+        /// <remarks>
+        /// Initialization and trigger creation run on the supplied backend. The caller must keep
+        /// the connection (and any session-level advisory lock) open throughout the call, and must
+        /// not close/reopen or use it concurrently. Without an active transaction, each command
+        /// commits independently; an error can leave partial provisioning to be retried. If the
+        /// connection already has a transaction, use the transaction overload instead.
+        /// The cancellation token is required to keep existing one-argument calls with
+        /// <c>default</c> unambiguous.
+        /// Other sync operations still use <see cref="PostgreSQLSyncConfiguration.ConnectionString"/>.
+        /// </remarks>
+        /// <param name="connection">The open connection that owns the provisioning session.</param>
+        /// <param name="cancellationToken">A token to cancel provisioning.</param>
+        /// <returns>A task representing the provisioning operation.</returns>
+        /// <exception cref="ArgumentNullException"><paramref name="connection"/> is null.</exception>
+        /// <exception cref="InvalidOperationException">The supplied session is closed or lost.</exception>
+        public Task ApplyProvisionAsync(NpgsqlConnection connection, CancellationToken cancellationToken)
+            => ApplyProvisionOnConnectionAsync(connection, null, cancellationToken);
+
+        /// <summary>
+        /// Provisions change tracking using an already-open connection and its caller-owned transaction.
+        /// </summary>
+        /// <remarks>
+        /// Every initialization and trigger command participates in <paramref name="transaction"/>.
+        /// The caller must commit it or roll it back after this call; the provider never commits, rolls back,
+        /// or disposes the transaction or connection. The caller must hold any advisory lock until
+        /// provisioning and the chosen transaction outcome complete. A rolled-back provisioning attempt
+        /// can be retried with this provider instance.
+        /// </remarks>
+        /// <param name="connection">The open connection that owns the provisioning session.</param>
+        /// <param name="transaction">An active transaction on <paramref name="connection"/>.</param>
+        /// <param name="cancellationToken">A token to cancel provisioning.</param>
+        /// <returns>A task representing the provisioning operation.</returns>
+        /// <exception cref="ArgumentNullException">A required argument is null.</exception>
+        /// <exception cref="ArgumentException">The transaction belongs to a different connection.</exception>
+        /// <exception cref="InvalidOperationException">The supplied session or transaction is lost.</exception>
+        public Task ApplyProvisionAsync(NpgsqlConnection connection, NpgsqlTransaction transaction, CancellationToken cancellationToken = default)
+        {
+            if (transaction == null)
+                throw new ArgumentNullException(nameof(transaction));
+
+            return ApplyProvisionOnConnectionAsync(connection, transaction, cancellationToken);
+        }
+
+        private async Task ApplyProvisionOnConnectionAsync(NpgsqlConnection connection, NpgsqlTransaction? transaction, CancellationToken cancellationToken)
+        {
+            using var session = new ProvisioningSession(connection, transaction, cancellationToken);
+            await InitializeStoreAsync(session, cancellationToken, cacheInitialization: false);
+            await CreateTriggersAsync(session, cancellationToken);
+        }
+
+        private async Task CreateTriggersAsync(ProvisioningSession session, CancellationToken cancellationToken)
+        {
+            using var cmd = session.CreateCommand(cancellationToken);
             foreach (var table in Configuration.Tables.Cast<PostgreSQLSyncTable>().Where(_ => _.Columns.Any()))
             {
                 if (table.SyncDirection == SyncDirection.UploadAndDownload ||
                     (table.SyncDirection == SyncDirection.UploadOnly && ProviderMode == ProviderMode.Local) ||
                     (table.SyncDirection == SyncDirection.DownloadOnly && ProviderMode == ProviderMode.Remote))
                 {
-                    await SetupTableForFullChangeDetection(table, cmd, cancellationToken);
+                    await SetupTableForFullChangeDetection(table, cmd, session, cancellationToken);
                 }
                 else
                 {
-                    await SetupTableForUpdatesOrDeletesOnly(table, cmd, cancellationToken);
+                    await SetupTableForUpdatesOrDeletesOnly(table, cmd, session, cancellationToken);
                 }
             }
+            session.EnsureActive(cancellationToken);
         }
 
-        private async Task SetupTableForFullChangeDetection(PostgreSQLSyncTable table, NpgsqlCommand cmd, CancellationToken cancellationToken = default)
+        private async Task SetupTableForFullChangeDetection(PostgreSQLSyncTable table, NpgsqlCommand cmd, ProvisioningSession session, CancellationToken cancellationToken)
         {
             var createTriggerBase = new Func<string, string>((op) => $@"
 DROP TRIGGER IF EXISTS __{table.Name}_ct_{op.ToLower()}__ ON ""{table.Name}"";
@@ -635,16 +707,16 @@ CREATE TRIGGER __{table.Name}_ct_{op.ToLower()}__
     EXECUTE FUNCTION __{table.Name}_ct_{op.ToLower()}__();");
 
             cmd.CommandText = createTriggerBase("INSERT");
-            await cmd.ExecuteNonQueryAsync(cancellationToken);
+            await session.ExecuteNonQueryAsync(cmd, cancellationToken);
 
             cmd.CommandText = createTriggerBase("UPDATE");
-            await cmd.ExecuteNonQueryAsync(cancellationToken);
+            await session.ExecuteNonQueryAsync(cmd, cancellationToken);
 
             cmd.CommandText = createTriggerBase("DELETE");
-            await cmd.ExecuteNonQueryAsync(cancellationToken);
+            await session.ExecuteNonQueryAsync(cmd, cancellationToken);
         }
 
-        private async Task SetupTableForUpdatesOrDeletesOnly(PostgreSQLSyncTable table, NpgsqlCommand cmd, CancellationToken cancellationToken = default)
+        private async Task SetupTableForUpdatesOrDeletesOnly(PostgreSQLSyncTable table, NpgsqlCommand cmd, ProvisioningSession session, CancellationToken cancellationToken)
         {
             var createTriggerBase = new Func<string, string>((op) => $@"
 DROP TRIGGER IF EXISTS __{table.Name}_ct_{op.ToLower()}__ ON ""{table.Name}"";
@@ -663,10 +735,10 @@ CREATE TRIGGER __{table.Name}_ct_{op.ToLower()}__
     EXECUTE FUNCTION __{table.Name}_ct_{op.ToLower()}__();");
 
             cmd.CommandText = createTriggerBase("UPDATE");
-            await cmd.ExecuteNonQueryAsync(cancellationToken);
+            await session.ExecuteNonQueryAsync(cmd, cancellationToken);
 
             cmd.CommandText = createTriggerBase("DELETE");
-            await cmd.ExecuteNonQueryAsync(cancellationToken);
+            await session.ExecuteNonQueryAsync(cmd, cancellationToken);
         }
 
         public async Task RemoveProvisionAsync(CancellationToken cancellationToken = default)
@@ -785,17 +857,18 @@ CREATE TRIGGER __{table.Name}_ct_{op.ToLower()}__
             using var connection = new NpgsqlConnection(Configuration.ConnectionString);
             await connection.OpenAsync(cancellationToken);
 
-            using var cmd = connection.CreateCommand();
+            using var session = new ProvisioningSession(connection, null, cancellationToken);
+            using var cmd = session.CreateCommand(cancellationToken);
 
             if (table.SyncDirection == SyncDirection.UploadAndDownload ||
                 (table.SyncDirection == SyncDirection.UploadOnly && ProviderMode == ProviderMode.Local) ||
                 (table.SyncDirection == SyncDirection.DownloadOnly && ProviderMode == ProviderMode.Remote))
             {
-                await SetupTableForFullChangeDetection(table, cmd, cancellationToken);
+                await SetupTableForFullChangeDetection(table, cmd, session, cancellationToken);
             }
             else
             {
-                await SetupTableForUpdatesOrDeletesOnly(table, cmd, cancellationToken);
+                await SetupTableForUpdatesOrDeletesOnly(table, cmd, session, cancellationToken);
             }
         }
          
@@ -830,5 +903,75 @@ DROP FUNCTION IF EXISTS __{tableName}_ct_{op.ToLower()}__();");
             await cmd.ExecuteNonQueryAsync();        
         }
 
+        private sealed class ProvisioningSession : IDisposable
+        {
+            private readonly NpgsqlConnection _connection;
+            private readonly NpgsqlTransaction? _transaction;
+            private readonly int _processId;
+            private int _connectionLost;
+
+            public ProvisioningSession(NpgsqlConnection connection, NpgsqlTransaction? transaction, CancellationToken cancellationToken)
+            {
+                _connection = connection ?? throw new ArgumentNullException(nameof(connection));
+                if (connection.State != ConnectionState.Open)
+                    throw new InvalidOperationException("PostgreSQL provisioning requires an open connection.");
+
+                if (transaction != null && !ReferenceEquals(transaction.Connection, connection))
+                    throw new ArgumentException("The transaction must be active on the supplied connection.", nameof(transaction));
+
+                cancellationToken.ThrowIfCancellationRequested();
+                _transaction = transaction;
+                _processId = connection.ProcessID;
+                connection.StateChange += OnStateChange;
+                try
+                {
+                    EnsureActive(cancellationToken);
+                }
+                catch
+                {
+                    connection.StateChange -= OnStateChange;
+                    throw;
+                }
+            }
+
+            public NpgsqlCommand CreateCommand(CancellationToken cancellationToken)
+            {
+                EnsureActive(cancellationToken);
+                var command = _connection.CreateCommand();
+                command.Transaction = _transaction;
+                return command;
+            }
+
+            public async Task<int> ExecuteNonQueryAsync(NpgsqlCommand command, CancellationToken cancellationToken)
+            {
+                EnsureActive(cancellationToken);
+                var result = await command.ExecuteNonQueryAsync(cancellationToken);
+                EnsureActive(cancellationToken);
+                return result;
+            }
+
+            public void EnsureActive(CancellationToken cancellationToken)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                if (Volatile.Read(ref _connectionLost) != 0 || _connection.State != ConnectionState.Open)
+                    throw new InvalidOperationException("The PostgreSQL provisioning session was lost.");
+
+                if (_connection.ProcessID != _processId)
+                    throw new InvalidOperationException("The PostgreSQL provisioning backend changed.");
+
+                if (_transaction != null && !ReferenceEquals(_transaction.Connection, _connection))
+                    throw new InvalidOperationException("The PostgreSQL provisioning transaction is no longer active.");
+            }
+
+            private void OnStateChange(object? sender, StateChangeEventArgs args)
+            {
+                if ((args.OriginalState & ConnectionState.Open) != 0 &&
+                    (args.CurrentState & ConnectionState.Open) == 0)
+                    Interlocked.Exchange(ref _connectionLost, 1);
+            }
+
+            public void Dispose() => _connection.StateChange -= OnStateChange;
+        }
+
     }
-} 
+}

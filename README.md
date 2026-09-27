@@ -96,6 +96,54 @@ await syncAgent.SynchronizeAsync();
 
 That's it — all changes made on either side will be transferred to the other.
 
+### PostgreSQL startup provisioning on a caller-owned session
+
+When startup uses a session-level PostgreSQL advisory lock, call the PostgreSQL-specific
+overload on the **same open `NpgsqlConnection`** that acquired the lock. The
+`ISyncProvider.ApplyProvisionAsync(CancellationToken)` method is unchanged and
+continues to open its own connections; it does not provide this guarantee.
+
+```csharp
+using CoreSync.PostgreSQL;
+using Npgsql;
+
+var provider = new PostgreSQLSyncProvider(
+    new PostgreSQLSyncConfigurationBuilder(connectionString).Table("items").Build());
+
+await using var connection = new NpgsqlConnection(connectionString);
+await connection.OpenAsync(cancellationToken);
+await using (var command = new NpgsqlCommand("SELECT pg_advisory_lock($1)", connection))
+{
+    command.Parameters.Add(new NpgsqlParameter { Value = 41024L });
+    await command.ExecuteNonQueryAsync(cancellationToken);
+}
+
+await provider.ApplyProvisionAsync(connection, cancellationToken);
+// Keep the connection and its lock open until startup provisioning has finished.
+```
+
+The overload never opens, closes, replaces, or disposes the supplied connection.
+It runs initialization and all trigger DDL on its backend; losing that session
+aborts the remaining writes rather than retrying on a different backend. Do not
+close/reopen or use the connection concurrently while provisioning. Without an
+active transaction, statements commit individually and a failed attempt can
+leave partial provisioning. If a transaction is already active on the connection,
+pass it explicitly: Npgsql otherwise enlists the commands in it anyway. To
+make provisioning atomic, begin a transaction on the
+locked connection and call
+`ApplyProvisionAsync(connection, transaction, cancellationToken)`; the caller
+must commit or roll back and keep the lock until that decision completes. The
+provider does not manage the caller's transaction. Both variants require a
+session-affine connection to PostgreSQL; transaction/statement-pooling proxies
+cannot preserve a session-level advisory lock across statements. Other provider
+operations still use the configured connection string.
+
+The PostgreSQL session tests require a disposable database with permission to
+create event triggers. Set `CORE-SYNC_POSTGRESQL_ISOLATED_CONNECTION_STRING`
+before running `dotnet test src/CoreSync.Tests/CoreSync.Tests.csproj --filter
+FullyQualifiedName~PostgreSQLProvisioningSessionTests`. Tests create unique
+schemas and leave their audit objects in that isolated database for inspection.
+
 ### Conflict Resolution
 
 When both sides modify the same record, you control what happens:
