@@ -140,9 +140,31 @@ operations still use the configured connection string.
 
 The PostgreSQL session tests require a disposable database with permission to
 create event triggers. Set `CORE-SYNC_POSTGRESQL_ISOLATED_CONNECTION_STRING`
-before running `dotnet test src/CoreSync.Tests/CoreSync.Tests.csproj --filter
-FullyQualifiedName~PostgreSQLProvisioningSessionTests`. Tests create unique
-schemas and leave their audit objects in that isolated database for inspection.
+before running:
+
+```bash
+dotnet test src/CoreSync.Tests/CoreSync.Tests.csproj --filter 'FullyQualifiedName~PostgreSQLProvisioningSessionTests'
+```
+
+Tests create unique schemas and leave their audit objects in that isolated
+database for inspection.
+
+#### Local PostgreSQL provider package
+
+Ordinary source builds and tests use the local CoreSync project. The unpublished
+`CoreSync.PostgreSQL` `0.1.129-local3` package instead compiles against and
+depends **exactly** on stable `CoreSync` `0.1.129`; it never requires a local
+CoreSync package. Pack only after committing the source, from a clean checkout:
+
+```bash
+dotnet restore src/CoreSync.PostgreSQL/CoreSync.PostgreSQL.csproj -p:PackWithStableCoreSync=true
+dotnet pack src/CoreSync.PostgreSQL/CoreSync.PostgreSQL.csproj -c Release --no-restore -p:PackWithStableCoreSync=true --output src/CoreSync.PostgreSQL/bin/Release/local3
+```
+
+Restore again without `PackWithStableCoreSync` before returning to ordinary
+source builds. The local3 DLL uses assembly/file version `0.1.129.3`; its
+informational version and the package's fork repository metadata identify the
+committed source revision.
 
 ### Conflict Resolution
 

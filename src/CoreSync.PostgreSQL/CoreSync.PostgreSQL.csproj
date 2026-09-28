@@ -1,9 +1,10 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <Version Condition=" '$(APPVEYOR_BUILD_VERSION)' == '' ">0.0.2-local.provisioning.20260927.2</Version>
+    <Version Condition=" '$(APPVEYOR_BUILD_VERSION)' == '' ">0.1.129-local3</Version>
     <Version Condition=" '$(APPVEYOR_BUILD_VERSION)' != '' ">$(APPVEYOR_BUILD_VERSION)</Version>
-    <AssemblyVersion Condition=" '$(Version)' == '0.0.2-local.provisioning.20260927.2' ">0.0.1.0</AssemblyVersion>
+    <AssemblyVersion Condition=" '$(Version)' == '0.1.129-local3' ">0.1.129.3</AssemblyVersion>
+    <FileVersion Condition=" '$(Version)' == '0.1.129-local3' ">0.1.129.3</FileVersion>
     <TargetFramework>netstandard2.0</TargetFramework>
     <Authors>adospace</Authors>
     <Description>CoreSync is a .NET standard library that provides data synchronization functions between databases. This is the PostgreSQL provider assembly.</Description>
@@ -12,9 +13,12 @@
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <PackageReadmeFile>README.md</PackageReadmeFile>
     <RepositoryUrl>https://github.com/adospace/CoreSync</RepositoryUrl>
-    <PackageReleaseNotes Condition=" '$(Version)' == '0.0.2-local.provisioning.20260927.2' ">Uncommitted local build on fix/postgres-caller-owned-provisioning, based on f32944d. Adds caller-owned PostgreSQL provisioning. Not an upstream release.</PackageReleaseNotes>
+    <RepositoryUrl Condition=" '$(Version)' == '0.1.129-local3' ">https://github.com/davidortinau/CoreSync</RepositoryUrl>
+    <RepositoryBranch Condition=" '$(Version)' == '0.1.129-local3' ">fix/postgres-caller-owned-provisioning</RepositoryBranch>
+    <PackageReleaseNotes Condition=" '$(Version)' == '0.1.129-local3' ">Local fork build with caller-owned PostgreSQL provisioning. Built against stable CoreSync 0.1.129; the repository commit and assembly informational version identify the committed source. Not published to NuGet.</PackageReleaseNotes>
     <PackageTags>postgresql postgres data database sync synchronization .net</PackageTags>
-    <GeneratePackageOnBuild>true</GeneratePackageOnBuild>
+    <GeneratePackageOnBuild Condition=" '$(Version)' == '0.1.129-local3' ">false</GeneratePackageOnBuild>
+    <GeneratePackageOnBuild Condition=" '$(Version)' != '0.1.129-local3' ">true</GeneratePackageOnBuild>
     <PackageRequireLicenseAcceptance>true</PackageRequireLicenseAcceptance>
     <Nullable>enable</Nullable>
     <LangVersion>latest</LangVersion>
@@ -37,8 +41,18 @@
     <PackageReference Include="System.ComponentModel.Annotations" Version="5.0.0" />
   </ItemGroup>
 
-  <ItemGroup>
+  <ItemGroup Condition=" '$(PackWithStableCoreSync)' == 'true' ">
+    <PackageReference Include="CoreSync" Version="[0.1.129]" />
+  </ItemGroup>
+
+  <ItemGroup Condition=" '$(PackWithStableCoreSync)' != 'true' ">
     <ProjectReference Include="..\CoreSync\CoreSync.csproj" />
   </ItemGroup>
 
-</Project> 
+  <Target Name="RequireStableCoreSyncForLocalPack"
+          BeforeTargets="GenerateNuspec"
+          Condition=" '$(Version)' == '0.1.129-local3' and '$(PackWithStableCoreSync)' != 'true' ">
+    <Error Text="Restore and pack CoreSync.PostgreSQL local3 with -p:PackWithStableCoreSync=true to depend on CoreSync [0.1.129]." />
+  </Target>
+
+</Project>
